@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpeakFlow: 英語音読練習アプリ</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Interフォントの読み込み (任意だが、デザインに影響) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Proseクラスの基本的なTailwind設定をオーバーライドして、改行を維持 */
+        .prose br {
+            content: "";
+            display: block;
+            margin-bottom: 0.5em; /* 適度な行間 */
+        }
+    </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-blue-100 to-purple-100 p-4 flex flex-col items-center justify-center">
+    <div id="root" class="w-full max-w-6xl"></div>
+
+    <!-- ReactとReactDOMのCDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel CDN (JSXをブラウザで変換するために必要) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script type="text/babel">
+        // メインのAppコンポーネント
+        function App() {
+          // ユーザーが入力する英文のステート
+          const [inputText, setInputText] = React.useState('');
+          // 録音された音声データのBlobオブジェクトを保持するステート
+          const [recordedAudioBlob, setRecordedAudioBlob] = React.useState(null);
+          // 録音中かどうかを示すブール値のステート
+          const [isRecording, setIsRecording] = React.useState(false);
+          // 音読評価の結果を保持するステート
+          const [evaluationResult, setEvaluationResult] = React.useState(null);
+          // 評価処理中かどうかを示すブール値のステート
+          const [isLoading, setIsLoading] = React.useState(false);
+          // エラーメッセージを保持するステート
+          const [errorMessage, setErrorMessage] = React.useState('');
+          // 音声認識によって得られたテキストを保持するステート（最終評価用）
+          const [recognitionText, setRecognitionText] = React.useState('');
+          // リアルタイムで認識されたテキストを保持するステート
+          const [liveRecognitionText, setLiveRecognitionText] = React.useState('');
+          // カスタムモーダルが表示されているかどうかのステート
+          const [showModal, setShowModal] = React.useState(false);
+          // カスタムモーダルに表示するメッセージのステート
+          const [modalMessage, setModalMessage] = React.useState('');
+
+          // MediaRecorderインスタンスへの参照
+          const mediaRecorderRef = React.useRef(null);
+          // 録音された音声のチャンクを一時的に保持する配列への参照
+          const audioChunksRef = React.useRef([]);
+          // ユーザーの音声を再生するための<audio>要素への参照
+          const audioRef = React.useRef(null);
+          // 録音開始時刻を記録するための参照（速さの計算に使用）
+          const recordingStartTimeRef = React.useRef(0);
+          // SpeechRecognitionインスタンスへの参照
+          const speechRecognitionRef = React.useRef(null);
+
+          // カスタムアラートモーダルコンポーネント
+          const CustomModal = ({ message, onClose }) => (
+            <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+              <div className="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full text-center rounded-xl">
+                <p className="text-lg mb-4 text-gray-800">{message}</p>
+                <button
+                  onClick={onClose}
+                  className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg focus:outline-none focus:shadow-outline transition-all duration-200"
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          );
+
+          // カスタムアラートを表示する関数
+          const showAlert = (message) => {
+            setModalMessage(message);
+            setShowModal(true);
+          };
+
+          // カスタムアラートを非表示にする関数
+          const hideAlert = () => {
+            setShowModal(false);
+            setModalMessage('');
+          };
+
+          // BlobデータをBase64文字列に変換する非同期関数
+          const blobToBase64 = (blob) => {
+            return new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result.split(',')[1]); // "data:audio/webm;base64," の部分を除去
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+            });
+          };
+
+          // 録音を開始する関数
+          const startRecording = async () => {
+            // 英文が入力されていない場合はアラートを表示して終了
+            if (!inputText.trim()) {
+              showAlert('英文を入力してください。');
+              return;
+            }
+            // エラーメッセージと評価結果をリセット
+            setErrorMessage('');
+            setEvaluationResult(null);
+            setRecordedAudioBlob(null);
+            setRecognitionText('');
+            setLiveRecognitionText(''); // リアルタイム認識テキストもリセット
+
+            try {
+              // MediaRecorder (音声録音用) の設定
+              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              mediaRecorderRef.current = new MediaRecorder(stream);
+              audioChunksRef.current = [];
+
+              mediaRecorderRef.current.ondataavailable = (event) => {
+                audioChunksRef.current.push(event.data);
+              };
+
+              mediaRecorderRef.current.onstop = () => {
+                const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+                setRecordedAudioBlob(audioBlob);
+                // ストリームのトラックを停止するのは、MediaRecorderとSpeechRecognitionの両方が停止した後に行う
+                // ここではまだSpeechRecognitionが動いている可能性があるので、stopRecordingでまとめて停止する
+              };
+
+              // SpeechRecognition (リアルタイム文字起こし用) の設定
+              if ('webkitSpeechRecognition' in window) {
+                const SpeechRecognition = window.webkitSpeechRecognition;
+                const recognition = new SpeechRecognition();
+                recognition.interimResults = true; // 部分的な結果も取得
+                recognition.continuous = true; // 連続認識
+                recognition.lang = 'en-US'; // 英語に設定
+
+                recognition.onresult = (event) => {
+                  let interimTranscript = '';
+                  let finalTranscript = '';
+
+                  for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                      finalTranscript += transcript;
+                    } else {
+                      interimTranscript += transcript;
+                    }
+                  }
+                  // リアルタイム表示には暫定的な結果と最終結果を結合して表示
+                  setLiveRecognitionText(finalTranscript + interimTranscript);
+                };
+
+                recognition.onerror = (event) => {
+                  console.error('SpeechRecognition error:', event.error);
+                  if (event.error === 'not-allowed') {
+                    showAlert('マイクへのアクセスが拒否されました。ブラウザの設定を確認してください。');
+                  } else {
+                    showAlert(`音声認識エラー: ${event.error}`);
+                  }
+                  setIsRecording(false); // エラー発生時は録音状態を解除
+                  // エラー発生時もストリームを停止
+                  stream.getTracks().forEach(track => track.stop());
+                  if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+                    mediaRecorderRef.current.stop();
+                  }
+                };
+
+                recognition.onend = () => {
+                  // 認識が終了したときにisRecordingをfalseにするのはstopRecordingで制御
+                  console.log('SpeechRecognition ended.');
+                };
+
+                speechRecognitionRef.current = recognition;
+                recognition.start(); // リアルタイム音声認識を開始
+              } else {
+                showAlert('お使いのブラウザはリアルタイム音声認識をサポートしていません。');
+                // SpeechRecognitionが利用できない場合でもMediaRecorderは開始する
+              }
+
+              recordingStartTimeRef.current = Date.now();
+              mediaRecorderRef.current.start(); // 音声録音を開始
+              setIsRecording(true); // 録音中ステートをtrueに設定
+            } catch (err) {
+              console.error('マイクへのアクセスに失敗しました:', err);
+              showAlert('マイクへのアクセスを許可してください。');
+              setIsRecording(false);
+            }
+          };
+
+          // 録音を停止する関数
+          const stopRecording = () => {
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+              mediaRecorderRef.current.stop(); // MediaRecorderを停止
+              // MediaRecorderが停止すると、onstopイベントでrecordedAudioBlobが設定される
+            }
+            if (speechRecognitionRef.current) {
+              speechRecognitionRef.current.stop(); // SpeechRecognitionを停止
+            }
+            setIsRecording(false); // 録音中ステートをfalseに設定
+
+            // すべてのメディアストリームのトラックを停止
+            if (mediaRecorderRef.current && mediaRecorderRef.current.stream) {
+              mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+            }
+          };
+
+          // 録音された音声を再生する関数
+          const playRecordedAudio = () => {
+            if (recordedAudioBlob) {
+              // BlobからURLを作成
+              const audioUrl = URL.createObjectURL(recordedAudioBlob);
+              if (audioRef.current) {
+                audioRef.current.src = audioUrl;
+                audioRef.current.play(); // 音声を再生
+              }
+            } else {
+              showAlert('録音された音声がありません。');
+            }
+          };
+
+          // 模範音声を再生する関数（Web Speech APIを使用）
+          const playModelPronunciation = () => {
+            if (!inputText.trim()) {
+              showAlert('英文を入力してください。');
+              return;
+            }
+            const utterance = new SpeechSynthesisUtterance(inputText);
+            utterance.lang = 'en-US'; // 英語（アメリカ）に設定
+            window.speechSynthesis.speak(utterance); // 音声を合成して再生
+          };
+
+          // 録音された音声を評価する関数
+          const evaluateRecording = async () => {
+            // 録音された音声がない場合や英文が入力されていない場合はアラートを表示
+            if (!recordedAudioBlob) {
+              showAlert('評価するには、まず音声を録音してください。');
+              return;
+            }
+            if (!inputText.trim()) {
+              showAlert('評価するには、英文が入力されている必要があります。');
+              return;
+            }
+
+            setIsLoading(true); // 評価中ステートをtrueに設定
+            setErrorMessage(''); // エラーメッセージをリセット
+            setEvaluationResult(null); // 評価結果をリセット
+
+            try {
+              // 録音された音声をBase64形式に変換
+              const base64Audio = await blobToBase64(recordedAudioBlob);
+
+              // ステップ1: ユーザーの音声を文字起こしする (Gemini APIを使用)
+              // リアルタイム認識はあくまでユーザーへのフィードバックであり、評価にはGeminiの文字起こしを使用
+              const transcriptionPrompt = "Please transcribe the following audio into English text. Only provide the transcribed text.";
+              const transcriptionPayload = {
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      { text: transcriptionPrompt },
+                      {
+                        inlineData: {
+                          mimeType: "audio/webm", // 音声のMIMEタイプ
+                          data: base64Audio // Base64形式の音声データ
+                        }
+                      }
+                    ]
+                  }
+                ],
+              };
+
+              const apiKey = ""; // Canvas環境によって提供されます
+              const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+              // Gemini APIを呼び出して文字起こしを実行
+              const transcriptionResponse = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(transcriptionPayload)
+              });
+
+              const transcriptionResult = await transcriptionResponse.json();
+              let transcribedText = '';
+              // accuracyPercentageをここで初期化
+              let accuracyPercentage = 0;
+
+              // レスポンスから文字起こしされたテキストを抽出
+              if (transcriptionResult.candidates && transcriptionResult.candidates.length > 0 &&
+                  transcriptionResult.candidates[0].content && transcriptionResult.candidates[0].content.parts &&
+                  transcriptionResult.candidates[0].content.parts.length > 0) {
+                transcribedText = transcriptionResult.candidates[0].content.parts[0].text;
+                setRecognitionText(transcribedText); // 認識されたテキストをステートに保存
+
+                // 簡単な正確性の計算（単語の一致度に基づく）
+                const originalWords = inputText.trim().toLowerCase().split(/\s+/);
+                const recognizedWords = transcribedText.trim().toLowerCase().split(/\s+/);
+                let correctWordsCount = 0;
+                originalWords.forEach((word, index) => {
+                  if (recognizedWords[index] && recognizedWords[index] === word) {
+                    correctWordsCount++;
+                  }
+                });
+                accuracyPercentage = originalWords.length > 0 ? (correctWordsCount / originalWords.length) * 100 : 0;
+              } else {
+                throw new Error('音声認識に失敗しました。もう一度お試しください。');
+              }
+
+              // 速さ（WPM: Words Per Minute）を計算
+              const audioDurationSeconds = (Date.now() - recordingStartTimeRef.current) / 1000; // 録音時間（秒）
+              const wordsInInput = inputText.trim().split(/\s+/).length; // 入力英文の単語数
+              const wpm = wordsInInput > 0 && audioDurationSeconds > 0 ? (wordsInInput / audioDurationSeconds) * 60 : 0;
+
+              // 速さのスコアを計算 (0-100点)
+              // 評価を甘くしつつ、100点は出にくくするための調整
+              const minWPM = 50;   // 最低目標WPMを下げて、より低いWPMでも点数が入るように
+              const optimalWPM = 100; // 最適WPMは維持
+              const maxWPM = 180;  // 100点に到達するためのWPMを高く設定
+
+              let speedScore = 0;
+
+              if (wpm < minWPM) {
+                speedScore = 0;
+              } else if (wpm <= optimalWPM) {
+                speedScore = ((wpm - minWPM) / (optimalWPM - minWPM)) * 70; // 0-70点
+              } else if (wpm <= maxWPM) {
+                speedScore = 70 + ((wpm - optimalWPM) / (maxWPM - optimalWPM)) * 30; // 70-100点
+              } else {
+                speedScore = 100;
+              }
+              speedScore = Math.max(0, Math.min(100, speedScore)); // 0-100の範囲に収める
+
+              // ステップ2: 元の英文と文字起こしされたテキストに基づいて評価を生成する (Gemini APIを使用)
+              const evaluationPrompt = `あなたは日本人中学生向けの英語教師です。提供された元の英文と、生徒の音読の文字起こしを比較し、以下の項目で短く評価してください。
+1. **正確性 (Accuracy):** 発音ミスや省略された単語があれば簡潔に指摘してください。
+2. **流暢さ (Fluency):** 音読の滑らかさ、自然さについて簡潔にコメントしてください。
+3. **発音アドバイス (Pronunciation Advice):** 改善すべき発音（例: L/R, Th, V/B）について具体的なアドバイスを1つか2つ簡潔に提供してください。
+4. **全体的な印象 (Overall Impression):** 短く、励ましのコメントをお願いします。
+
+また、以下の点数も参考に、全体的な評価に含めてください。
+正確性スコア: ${accuracyPercentage.toFixed(1)}%
+速さスコア: ${speedScore.toFixed(1)}点
+合計点数: ${(accuracyPercentage * 0.7 + speedScore * 0.3).toFixed(1)}点 (正確性70%、速さ30%の割合)
+
+評価は日本語で、各項目を明確に区切って提供してください。`;
+
+              const evaluationPayload = {
+                contents: [
+                  {
+                    role: "user",
+                    parts: [{ text: evaluationPrompt }]
+                  }
+                ],
+              };
+
+              // Gemini APIを呼び出して評価を実行
+              const evaluationResponse = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(evaluationPayload)
+              });
+
+              const evaluationResultData = await evaluationResponse.json();
+              if (evaluationResultData.candidates && evaluationResultData.candidates.length > 0 &&
+                  evaluationResultData.candidates[0].content && evaluationResultData.candidates[0].content.parts &&
+                  evaluationResultData.candidates[0].content.parts.length > 0) {
+                const feedbackText = evaluationResultData.candidates[0].content.parts[0].text;
+
+                // 最終的な合計点数を計算
+                const totalScore = (accuracyPercentage * 0.7) + (speedScore * 0.3);
+
+
+                setEvaluationResult({
+                  accuracy: accuracyPercentage.toFixed(1), // 小数点以下1桁に丸める
+                  speed: wpm.toFixed(1), // 小数点以下1桁に丸める
+                  totalScore: totalScore.toFixed(1), // 合計点数も小数点以下1桁に丸める
+                  feedback: feedbackText,
+                  transcribedText: transcribedText,
+                });
+              } else {
+                throw new Error('評価の生成に失敗しました。');
+              }
+
+            } catch (err) {
+              console.error('評価中にエラーが発生しました:', err);
+              setErrorMessage(`評価中にエラーが発生しました: ${err.message}`);
+              showAlert(`評価中にエラーが発生しました: ${err.message}`);
+            } finally {
+              setIsLoading(false); // 評価中ステートをfalseに設定
+            }
+          };
+
+          return (
+            // アプリ全体のコンテナ。Tailwind CSSでスタイリング。
+            // `font-inter` クラスは、Interフォントが読み込まれていることを前提としています。
+            <div className="min-h-screen bg-gradient-to-br from-blue-100 to-purple-100 p-4 font-inter flex flex-col items-center justify-center">
+              {/* カスタムモーダルを表示 */}
+              {showModal && <CustomModal message={modalMessage} onClose={hideAlert} />}
+
+              {/* アプリのタイトル */}
+              <h1 className="text-4xl font-bold text-gray-800 mb-6 text-center">
+                SpeakFlow: 音読練習アプリ
+              </h1>
+
+              {/* メインコンテンツエリア。横長画面で左右に分割されるようにflexを使用。 */}
+              <div className="w-full max-w-6xl bg-white rounded-2xl shadow-xl p-8 flex flex-col lg:flex-row gap-8">
+                {/* 左パネル: 英文入力とコントロールボタン */}
+                <div className="flex-1 flex flex-col space-y-6">
+                  <div className="flex flex-col">
+                    <label htmlFor="english-text" className="text-lg font-semibold text-gray-700 mb-2">
+                      練習したい英文を入力してください:
+                    </label>
+                    <textarea
+                      id="english-text"
+                      className="w-full p-4 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 resize-y min-h-[150px] text-gray-800 text-lg"
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      placeholder="例: This is a pen. I like to study English."
+                    ></textarea>
+                  </div>
+
+                  {/* リアルタイム認識テキスト表示エリア */}
+                  {isRecording && (
+                    <div className="bg-blue-50 p-4 rounded-lg shadow-sm border border-blue-200">
+                      <p className="text-lg font-semibold mb-2 text-blue-700">リアルタイム認識:</p>
+                      <p className="text-xl font-medium text-blue-900 min-h-[30px]">{liveRecognitionText || '話しかけてください...'}</p>
+                    </div>
+                  )}
+
+                  {/* コントロールボタン群 */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <button
+                      onClick={startRecording}
+                      disabled={isRecording || isLoading}
+                      className={`py-3 px-6 rounded-xl font-bold text-white transition-all duration-300 ${
+                        isRecording
+                          ? 'bg-red-600 hover:bg-red-700 animate-pulse' // 録音中は赤色で点滅
+                          : 'bg-green-500 hover:bg-green-600' // 通常は緑色
+                      } focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 shadow-md`}
+                    >
+                      {isRecording ? '録音中...' : '録音開始'}
+                    </button>
+                    <button
+                      onClick={stopRecording}
+                      disabled={!isRecording || isLoading}
+                      className="py-3 px-6 bg-yellow-500 hover:bg-yellow-600 text-white rounded-xl font-bold transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500 shadow-md"
+                    >
+                      録音停止
+                    </button>
+                    <button
+                      onClick={playRecordedAudio}
+                      disabled={!recordedAudioBlob || isRecording || isLoading}
+                      className="py-3 px-6 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-bold transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 shadow-md"
+                    >
+                      自分の音声を再生
+                    </button>
+                    <button
+                      onClick={playModelPronunciation}
+                      disabled={isRecording || isLoading || !inputText.trim()}
+                      className="py-3 px-6 bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl font-bold transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 shadow-md"
+                    >
+                      模範音声を再生
+                    </button>
+                    <button
+                      onClick={evaluateRecording}
+                      disabled={!recordedAudioBlob || isRecording || isLoading}
+                      className="py-3 px-6 bg-purple-500 hover:bg-purple-600 text-white rounded-xl font-bold transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 shadow-md col-span-full md:col-span-1"
+                    >
+                      {isLoading ? '評価中...' : '音声を評価'}
+                    </button>
+                  </div>
+                  {/* 音声再生用の非表示のaudio要素 */}
+                  <audio ref={audioRef} className="hidden"></audio>
+                </div>
+
+                {/* 右パネル: 評価結果表示 */}
+                <div className="flex-1 bg-gray-50 p-6 rounded-2xl shadow-inner flex flex-col">
+                  <h2 className="text-2xl font-bold text-gray-800 mb-4 text-center">評価結果</h2>
+                  {/* 評価中のローディングインジケーター */}
+                  {isLoading && (
+                    <div className="flex items-center justify-center h-full">
+                      <div className="animate-spin rounded-full h-12 w-12 border-4 border-t-4 border-blue-500 border-opacity-25"></div>
+                      <p className="ml-4 text-gray-600 text-lg">評価中...</p>
+                    </div>
+                  )}
+                  {/* エラーメッセージ表示 */}
+                  {errorMessage && (
+                    <p className="text-red-600 text-center text-lg mt-4">{errorMessage}</p>
+                  )}
+                  {/* 評価結果が表示されるエリア */}
+                  {evaluationResult && (
+                    <div className="space-y-4 text-gray-700">
+                      {/* 総合点数 */}
+                      <div className="bg-gradient-to-r from-blue-200 to-blue-300 p-4 rounded-lg shadow-md text-center">
+                        <p className="text-xl font-bold text-blue-800 mb-2">総合点数:</p>
+                        <p className="text-5xl font-extrabold text-blue-900">{evaluationResult.totalScore}<span className="text-3xl">/100</span></p>
+                      </div>
+
+                      {/* 認識されたテキスト */}
+                      <div className="bg-blue-50 p-4 rounded-lg shadow-sm">
+                        <p className="text-lg font-semibold mb-2">認識されたテキスト (評価用):</p>
+                        <p className="text-xl font-medium text-blue-800">{evaluationResult.transcribedText || 'N/A'}</p>
+                      </div>
+
+                      {/* 正確性と速さのスコア */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div className="bg-green-50 p-4 rounded-lg shadow-sm">
+                          <p className="text-lg font-semibold">正確性 (Accuracy):</p>
+                          <p className="text-3xl font-bold text-green-700">{evaluationResult.accuracy}%</p>
+                        </div>
+                        <div className="bg-yellow-50 p-4 rounded-lg shadow-sm">
+                          <p className="text-lg font-semibold">速さ (Speed):</p>
+                          <p className="text-3xl font-bold text-yellow-700">{evaluationResult.speed} WPM</p>
+                        </div>
+                      </div>
+
+                      {/* AIからのフィードバック */}
+                      <div className="bg-purple-50 p-4 rounded-lg shadow-sm">
+                        <p className="text-lg font-semibold mb-2">AIからのフィードバック:</p>
+                        {/* AIからのフィードバックはHTMLとしてレンダリングされるため、改行を<br/>に変換 */}
+                        <div className="prose max-w-none text-gray-800" dangerouslySetInnerHTML={{ __html: evaluationResult.feedback.replace(/\n/g, '<br/>') }}></div>
+                      </div>
+                    </div>
+                  )}
+                  {/* 初期状態または結果がない場合のメッセージ */}
+                  {!isLoading && !errorMessage && !evaluationResult && (
+                    <p className="text-center text-gray-500 text-lg mt-4">
+                      英文を入力し、録音して「音声を評価」ボタンを押してください。
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* フッター */}
+              <footer className="mt-8 text-gray-600 text-sm text-center">
+                © 2024 SpeakFlow. All rights reserved.
+              </footer>
+            </div>
+          );
+        }
+
+        // Reactアプリケーションをルート要素にレンダリング
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
